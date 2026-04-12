@@ -2,7 +2,9 @@
 #define COMPONENTS_PID_CONTROLLER_HPP
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 namespace gdut {
@@ -13,6 +15,11 @@ template <typename T> class pid_controller {
 
 public:
   pid_controller() = default;
+
+  pid_controller(const pid_controller &other) = default;
+  pid_controller &operator=(const pid_controller &other) = default;
+  pid_controller(pid_controller &&other) noexcept = default;
+  pid_controller &operator=(pid_controller &&other) noexcept = default;
 
   pid_controller(T Kp, T Ki, T Kd, T DeadZone = T{},
                  T IntegralWindupLimit = T{},
@@ -126,6 +133,13 @@ public:
     return m_output =
                std::clamp(Kp * error + Ki * m_integral + Kd * m_deriv_filter,
                           MinOutput, MaxOutput);
+  }
+
+  void reset() {
+    m_integral = T{};
+    m_prev_error = T{};
+    m_output = T{};
+    m_deriv_filter = T{};
   }
 
 private:
