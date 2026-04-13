@@ -25,8 +25,13 @@ public:
         direction_gpio_port_(direction_gpio_port),
         direction_gpio_pin_(direction_gpio_pin), ppr_(ppr > 0.0f ? ppr : 1.0f),
         current_encoder_count_(0), total_revolutions_(0.0f),
-        current_speed_(0.0f), enabled_(true) {
+        current_speed_(0.0f) {
     init_encoder_state();
+    if (pwm_timer_) {
+      pwm_timer_->start();
+      gdut::timer::timer_pwm pwm(pwm_timer_);
+      pwm.pwm_start(pwm_channel_A_);
+    }
   }
 
   // 移动构造
@@ -37,7 +42,7 @@ public:
         direction_gpio_pin_(other.direction_gpio_pin_), ppr_(other.ppr_),
         current_encoder_count_(other.current_encoder_count_),
         total_revolutions_(other.total_revolutions_),
-        current_speed_(other.current_speed_), enabled_(other.enabled_) {
+        current_speed_(other.current_speed_) {
     other.pwm_timer_ = nullptr;
     other.encoder_timer_ = nullptr;
   }
@@ -52,12 +57,6 @@ public:
   uint32_t get_current_encoder_count() const { return current_encoder_count_; }
 
   // ----- 控制 -----
-  void enable(bool enable) { // 使能或禁用输出
-    enabled_ = enable;
-    if (!enabled_) {
-      set_pwm_duty(0.0f);
-    }
-  }
 
   // 刷新编码器状态（建议在定时器中断中周期调用）
   void refresh_encoder_state(float control_period_sec) {
@@ -93,16 +92,8 @@ public:
         static_cast<float>(delta_count) / (ppr_ * control_period_sec);
   }
 
-protected:
-  void init_encoder_state() {
-    if (!encoder_timer_)
-      return;
-    gdut::timer::timer_proxy proxy(encoder_timer_);
-    current_encoder_count_ = proxy.get_counter();
-    total_revolutions_ = static_cast<float>(current_encoder_count_) / ppr_;
-  }
-
-  void set_pwm_duty(float duty) { // 通过 GPIO 控制方向，并设置单个 PWM 通道的占空比
+  // 通过 GPIO 控制方向，并设置单个 PWM 通道的占空比
+  void set_pwm_duty(float duty) {
     if (!pwm_timer_)
       return;
 
@@ -115,13 +106,27 @@ protected:
     uint32_t compare_A = static_cast<uint32_t>(duty_abs * max_compare);
     gdut::timer::timer_pwm pwm(pwm_timer_);
 
+    // 注意：此处方向由 GPIO 决定，同时GPIO与PWM作差得到最终比较值
+    // 所以负方向的占空比需要通过 max_compare - compare_A
+    // 来实现反转，而不是直接使用 compare_A
     if (clamped_duty >= 0.0f) {
-      direction_gpio_port_->BSRR = direction_gpio_pin_;
+      HAL_GPIO_WritePin(direction_gpio_port_, direction_gpio_pin_,
+                        GPIO_PIN_RESET);
     } else {
-      direction_gpio_port_->BSRR = static_cast<uint32_t>(direction_gpio_pin_)
-                                   << 16U;
+      HAL_GPIO_WritePin(direction_gpio_port_, direction_gpio_pin_,
+                        GPIO_PIN_SET);
+      compare_A = max_compare - compare_A;
     }
     pwm.set_duty(pwm_channel_A_, compare_A);
+  }
+
+protected:
+  void init_encoder_state() {
+    if (!encoder_timer_)
+      return;
+    gdut::timer::timer_proxy proxy(encoder_timer_);
+    current_encoder_count_ = proxy.get_counter();
+    total_revolutions_ = static_cast<float>(current_encoder_count_) / ppr_;
   }
 
 private:
@@ -139,8 +144,6 @@ private:
   uint32_t current_encoder_count_;
   float total_revolutions_; // 累计圈数
   float current_speed_;     // 转/秒
-
-  bool enabled_;
 };
 
 } // namespace gdut
