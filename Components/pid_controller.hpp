@@ -2,7 +2,9 @@
 #define COMPONENTS_PID_CONTROLLER_HPP
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 namespace gdut {
@@ -13,6 +15,11 @@ template <typename T> class pid_controller {
 
 public:
   pid_controller() = default;
+
+  pid_controller(const pid_controller &other) = default;
+  pid_controller &operator=(const pid_controller &other) = default;
+  pid_controller(pid_controller &&other) noexcept = default;
+  pid_controller &operator=(pid_controller &&other) noexcept = default;
 
   pid_controller(T Kp, T Ki, T Kd, T DeadZone = T{},
                  T IntegralWindupLimit = T{},
@@ -31,6 +38,7 @@ public:
     this->Kp = Kp;
     return true;
   }
+
   [[nodiscard]] bool set_Ki(T Ki) {
     if (Ki < T{}) {
       return false; // Integral gain must be non-negative
@@ -38,6 +46,7 @@ public:
     this->Ki = Ki;
     return true;
   }
+
   [[nodiscard]] bool set_Kd(T Kd) {
     if (Kd < T{}) {
       return false; // Derivative gain must be non-negative
@@ -45,6 +54,7 @@ public:
     this->Kd = Kd;
     return true;
   }
+
   [[nodiscard]] bool set_dead_zone(T DeadZone) {
     if (DeadZone < T{}) {
       return false; // Dead zone must be non-negative
@@ -52,6 +62,7 @@ public:
     this->DeadZone = DeadZone;
     return true;
   }
+
   [[nodiscard]] bool set_integral_windup_limit(T IntegralWindupLimit) {
     if (IntegralWindupLimit < T{}) {
       return false; // Integral windup limit must be non-negative
@@ -59,6 +70,7 @@ public:
     this->IntegralWindupLimit = IntegralWindupLimit;
     return true;
   }
+
   [[nodiscard]] bool set_output_limits(T MinOutput, T MaxOutput) {
     if (MinOutput >= MaxOutput) {
       return false; // Minimum output must be less than maximum output
@@ -74,6 +86,15 @@ public:
     }
     this->Alpha = Alpha;
     return true;
+  }
+
+  void set_integral(T integral) {
+    if (IntegralWindupLimit > T{}) {
+      m_integral =
+          std::clamp(integral, -IntegralWindupLimit, IntegralWindupLimit);
+    } else {
+      m_integral = integral;
+    }
   }
 
   [[nodiscard]] bool
@@ -112,6 +133,13 @@ public:
     return m_output =
                std::clamp(Kp * error + Ki * m_integral + Kd * m_deriv_filter,
                           MinOutput, MaxOutput);
+  }
+
+  void reset() {
+    m_integral = T{};
+    m_prev_error = T{};
+    m_output = T{};
+    m_deriv_filter = T{};
   }
 
 private:
