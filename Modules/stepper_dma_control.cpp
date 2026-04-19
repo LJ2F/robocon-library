@@ -1,235 +1,399 @@
-#include "steppr_dma_control.hpp"
+#include "stepper_dma_control.hpp"
 
 #include <algorithm>
 
 namespace app {
+//构造函数
+multi_stepper_dma::multi_stepper_dma(
+    gdut::timer &timer,
+    const std::array<motor_config, motor_count> &configs)
+    : m_timer(timer), m_timer_proxy(&timer), m_oc(&timer), m_cfg(configs) {}
 
-stepper_dma_controller::stepper_dma_controller(gdut::timer &step_timer,
-                                               gdut::dma_proxy &dma,
-                                               const config &cfg)
-    : m_timer(step_timer), m_dma(dma), m_timer_proxy(&step_timer),
-      m_pwm(&step_timer), m_cfg(cfg) {}
-
-HAL_StatusTypeDef stepper_dma_controller::init() {
-  if (m_timer.get_htim() == nullptr || m_dma.get_handle() == nullptr ||
-      m_cfg.dir_port == nullptr || m_cfg.step_high_ticks == 0U) {
+    //初始化函数
+HAL_StatusTypeDef multi_stepper_dma::init() {
+  if (m_timer.get_htim() == nullptr) {
     return HAL_ERROR;
   }
 
-  // 这里默认 DMA 的 stream/channel/request 已经在 CubeMX 或 MSP 里配好。
-  // 只借用 dma_proxy 做 init 和句柄管理。
-  m_dma.init();
-
-  // 运行时让 timer 接管这个 DMA 句柄的完成/错误回调，防止两个冲突，兔同时处理。
-  m_timer.attach_dma(m_dma.get_handle());
-  // 注册回调函数
-  register_callbacks();
-
-  return HAL_OK;
-}
-//采用timer 的dma回调函数，完成/错误/周期回调
-void stepper_dma_controller::register_callbacks() {
-  m_timer.register_dma_xfer_cplt_callback([this]() { on_dma_complete(); });
-  m_timer.register_dma_error_callback([this]() { on_dma_error(); });
-  m_timer.register_period_elapsed_callback([this]() { on_period_elapsed(); });
-}
-
-HAL_StatusTypeDef stepper_dma_controller::start_move(const uint16_t *arr_table,
-                                                     std::size_t pulse_count,
-                                                     GPIO_PinState dir_level) {
-  if (arr_table == nullptr || pulse_count == 0U || m_busy) {
+  // 注册 4 个通道的 CC 回调
+  bool ok = true;
+  ok &= m_timer.register_capture_callback(1, [this]() { on_cc_event(0); });
+  ok &= m_timer.register_capture_callback(2, [this]() { on_cc_event(1); });
+   ok &= m_timer.register_capture_callback(3, [this]() { on_cc_event(2); });
+  ok &= m_timer.register_capture_callback(4, [this]() { on_cc_event(3); });
+  if (!ok) {
     return HAL_ERROR;
   }
 
-  TIM_HandleTypeDef *htim = m_timer.get_htim();
-  DMA_HandleTypeDef *hdma = m_dma.get_handle();
-  if (htim == nullptr || hdma == nullptr) {
-    return HAL_ERROR;
-  }
-//必须判断步高时间不能小于1个定时器周期
-  if (arr_table[0] <= m_cfg.step_high_ticks) {
-    return HAL_ERROR;
-  }
-//参数的传递
-  m_arr_table = arr_table;
-  m_pulse_count = pulse_count;
-  m_busy = true;
-  m_wait_final_period = false;
-  m_dma_error = false;
-//设置方向
-  HAL_GPIO_WritePin(m_cfg.dir_port, m_cfg.dir_pin, dir_level);
-
-  // 清掉旧状态。
-  (void)HAL_TIM_PWM_Stop(htim, m_cfg.pwm_channel);
-  __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_UPDATE);
-  __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
-  (void)HAL_DMA_Abort(hdma);
-  __HAL_TIM_SET_COUNTER(htim, 0U);
-
-  prepare_first_period(arr_table[0]);
-
-  if (pulse_count == 1U) {
-    // 只有一个脉冲时，不开 DMA。
-    m_wait_final_period = true;
-    m_timer.enable_it(TIM_IT_UPDATE);
-
-    HAL_StatusTypeDef ret = m_pwm.pwm_start(m_cfg.pwm_channel);
-    if (ret != HAL_OK) {
-      (void)stop();
+  // 初始化各路 DMA，并分别绑定各自的完成/错误回调。
+  // 这里不调用 timer.attach_dma()，因为 timer 只有一个 DMA 槽位。
+  for (std::size_t i = 0; i < motor_count; ++i) {
+    auto &cfg = m_cfg[i];//每个电机一个
+    const bool unused_cfg = (cfg.dma == nullptr && cfg.dir_port == nullptr &&
+                             cfg.dir_pin == 0U && cfg.pulse_high_ticks == 0U);
+    if (unused_cfg) {
+      m_state[i] = {};
+      continue;
     }
-    return ret;
+
+    if (cfg.dma == nullptr || cfg.dir_port == nullptr || cfg.dir_pin == 0U ||
+        cfg.pulse_high_ticks == 0U) {
+      return HAL_ERROR;
+    }
+
+    cfg.dma->init();
+    cfg.dma->set_callback_handler([this, i](std::error_code ec) {
+      if (ec) {
+        on_dma_error(i);//每个dma的错误回调
+      } else {
+        on_dma_complete(i);//每个dma的完成回调
+      }
+    });
+
+    m_state[i] = {};
   }
 
-  HAL_StatusTypeDef ret = start_dma_tail();
-  if (ret != HAL_OK) {
-    (void)stop();
-    return ret;
-  }
-
-  // DMA 传输期间先不开更新中断，避免与最后一次的逻辑冲突
-  __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
-
-  ret = m_pwm.pwm_start(m_cfg.pwm_channel);
-  if (ret != HAL_OK) {
-    (void)stop();
-  }
-  return ret;
-}
-
-void stepper_dma_controller::prepare_first_period(uint16_t first_arr) {
-  TIM_HandleTypeDef *htim = m_timer.get_htim();
-  if (htim == nullptr) {
-    return;
-  }
-
-  m_pwm.set_duty(m_cfg.pwm_channel, m_cfg.step_high_ticks);
-  m_timer_proxy.set_arr(first_arr);
-  m_timer_proxy.set_counter(0U);
-
-  // 把预装载值立刻刷进活动寄存器，保证第一周期就按 table[0] 运行。
-  (void)HAL_TIM_GenerateEvent(htim, TIM_EVENTSOURCE_UPDATE);
-}
-//第 2 个脉冲开始到最后一个脉冲”的 ARR 数据交给 DMA，
-// 让 DMA 在定时器更新事件时自动把新的周期值写进定时器的 ARR 寄存器。
-HAL_StatusTypeDef stepper_dma_controller::start_dma_tail() {
-  TIM_HandleTypeDef *htim = m_timer.get_htim();
-  DMA_HandleTypeDef *hdma = m_dma.get_handle();
-  if (htim == nullptr || hdma == nullptr || m_pulse_count < 2U) {
+  // 启动 timer 基本计数，HAL_TIM_BASIC_START
+  if (m_timer.start() != HAL_OK) {
     return HAL_ERROR;
   }
 
-  // dma_proxy::start() 会重新改 Parent/回调，和 timer::attach_dma() 冲突。
-  // 所以这里直接调用 HAL_DMA_Start_IT
-  HAL_StatusTypeDef ret = HAL_DMA_Start_IT(
-      hdma, reinterpret_cast<uint32_t>(&m_arr_table[1]),
-      reinterpret_cast<uint32_t>(&htim->Instance->ARR), m_pulse_count - 1U);
-  if (ret != HAL_OK) {
-    return ret;
+#if defined(TIM_BDTR_MOE)
+  if (IS_TIM_BREAK_INSTANCE(m_timer.get_htim()->Instance)) {
+    __HAL_TIM_MOE_ENABLE(m_timer.get_htim());
   }
+#endif
 
-  __HAL_TIM_ENABLE_DMA(htim, TIM_DMA_UPDATE);
   return HAL_OK;
 }
+//是否正在运行
+bool multi_stepper_dma::is_busy(std::size_t motor_id) const {
+  return (motor_id < motor_count) ? m_state[motor_id].busy : false;
+}
+//dma的停止
+bool multi_stepper_dma::has_dma_error(std::size_t motor_id) const {
+  return (motor_id < motor_count) ? m_state[motor_id].dma_error : true;
+}
 
-HAL_StatusTypeDef stepper_dma_controller::stop() {
-  TIM_HandleTypeDef *htim = m_timer.get_htim();
-  DMA_HandleTypeDef *hdma = m_dma.get_handle();
-  if (htim == nullptr || hdma == nullptr) {
-    return HAL_ERROR;
+//构建表值
+std::size_t multi_stepper_dma::build_toggle_table(const uint16_t *period_table,//每个脉冲的总周期表
+                                                  std::size_t pulse_count,  //脉冲数
+                                                  uint16_t pulse_high_ticks,//脉冲高时间
+                                                  uint32_t first_rise_tick,//第一个上升沿时间
+                                                  uint32_t *out_toggle_table,//输出数组，保存所有翻转的值
+                                                  std::size_t out_cap) //输出数组容量
+                                                  {
+  if (period_table == nullptr || out_toggle_table == nullptr || pulse_count == 0U) {
+    return 0U;
   }
-
-  __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_UPDATE);
-  __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
-  (void)HAL_DMA_Abort(hdma);
-  (void)m_pwm.pwm_stop(m_cfg.pwm_channel);
-
-  m_arr_table = nullptr;
-  m_pulse_count = 0U;
-  m_busy = false;
-  m_wait_final_period = false;
-  return HAL_OK;
-}
-
-HAL_StatusTypeDef stepper_dma_controller::emergency_stop() {
-  return stop();
-}
-
-void stepper_dma_controller::on_dma_complete() {
-  TIM_HandleTypeDef *htim = m_timer.get_htim();
-  if (htim == nullptr || !m_busy) {
-    return;
-  }
-
-  // 现在最后一个 ARR 已经写进寄存器了，但最后一个 PWM 周期还没跑完。
-  // 所以：
-  // 1) 先关掉 DMA 请求，防止继续请求 DMA
-  // 2) 打开更新中断
-  // 3) 等下一个更新事件到来，再真正 stop()
-  __HAL_TIM_DISABLE_DMA(htim, TIM_DMA_UPDATE);
-  m_wait_final_period = true;
-  m_timer.enable_it(TIM_IT_UPDATE);
-}
-
-void stepper_dma_controller::on_dma_error() {
-  m_dma_error = true;
-  (void)stop();
-}
-
-void stepper_dma_controller::on_period_elapsed() {
-  if (!m_busy || !m_wait_final_period) {
-    return;
-  }
-
-  m_wait_final_period = false;
-  (void)stop();
-}
-//构建梯形运动数组生成trapezoid_arr_table
-//buf: 输出数组，用于存储梯形运动数组，每个元素为 uint16_t 类型
-//arr_start: 初始 ARR 值，必须大于等于 arr_min
-//arr_min: 最小 ARR 值，必须小于等于 arr_start
-//accel_steps: 加速步数，必须大于等于 0
-//decel_steps: 减速步数，必须大于等于 0
-//返回值: 实际生成的梯形运动数组长度，可能小于 max_len
-std::size_t stepper_dma_controller::build_trapezoid_arr_table(
-    uint16_t *buf, std::size_t max_len, std::size_t steps, uint16_t arr_start,
-    uint16_t arr_min, std::size_t accel_steps, std::size_t decel_steps) {
-  if (buf == nullptr || max_len == 0U || steps == 0U || arr_start < arr_min) {
+//输出数组容量是否足够
+  if (out_cap < pulse_count * 2U) {
     return 0U;
   }
 
-  steps = std::min(steps, max_len);
-  if (accel_steps + decel_steps > steps) {
-    accel_steps = steps / 2U;
-    decel_steps = steps - accel_steps;
-  }
-
-  const std::size_t const_steps = steps - accel_steps - decel_steps;
-  const uint32_t delta = static_cast<uint32_t>(arr_start - arr_min);
+  uint32_t t = first_rise_tick;
   std::size_t idx = 0U;
-
-  for (std::size_t i = 0U; i < accel_steps; ++i) {
-    const uint32_t div = (accel_steps == 0U) ? 1U : static_cast<uint32_t>(accel_steps);
-    uint16_t arr = static_cast<uint16_t>(arr_start - (delta * i) / div);
-    if (arr < arr_min) {
-      arr = arr_min;
+//脉冲数
+  for (std::size_t i = 0; i < pulse_count; ++i) {
+    const uint16_t period = period_table[i];
+    if (period <= pulse_high_ticks) {
+      return 0U;
     }
-    buf[idx++] = arr;
-  }
 
-  for (std::size_t i = 0U; i < const_steps; ++i) {
-    buf[idx++] = arr_min;
-  }
+    // 上升沿
+    out_toggle_table[idx++] = t;
 
-  for (std::size_t i = 0U; i < decel_steps; ++i) {
-    const uint32_t div = (decel_steps == 0U) ? 1U : static_cast<uint32_t>(decel_steps);
-    uint16_t arr = static_cast<uint16_t>(arr_min + (delta * i) / div);
-    if (arr > arr_start) {
-      arr = arr_start;
-    }
-    buf[idx++] = arr;
+    // 下降沿
+    t += pulse_high_ticks;
+    out_toggle_table[idx++] = t;
+
+    // 下一脉冲上升沿
+    t += (period - pulse_high_ticks);
   }
 
   return idx;
+}
+//开始移动
+HAL_StatusTypeDef multi_stepper_dma::start_motor(std::size_t motor_id,//那一路的dma
+                                                 const uint32_t *toggle_table,//每个翻转的时间表
+                                                 std::size_t toggle_count,//翻转次数
+                                                 GPIO_PinState dir_level,//方向
+                                                 uint32_t first_compare)//第一个比较点
+                                                  {
+  if (motor_id >= motor_count || toggle_table == nullptr || toggle_count < 2U) {
+    return HAL_ERROR;
+  }
+
+  auto &cfg = m_cfg[motor_id];
+  auto &st = m_state[motor_id];
+  auto *htim = m_timer.get_htim();
+  auto *hdma = cfg.dma->get_handle();
+
+  if (htim == nullptr || hdma == nullptr) {
+    return HAL_ERROR;
+  }
+
+  if (st.busy) {
+    return HAL_BUSY;
+  }
+
+  // 先停止其他的
+  (void)stop_motor(motor_id);
+ //先写方向
+  HAL_GPIO_WritePin(cfg.dir_port, cfg.dir_pin, dir_level);
+
+  // 先手动装第一个比较点
+  m_oc.set_compare(cfg.channel, first_compare);
+
+  // 清这个通道的 CC 标志
+  switch (cfg.channel) {
+  case TIM_CHANNEL_1:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC1);
+    break;
+  case TIM_CHANNEL_2:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC2);
+    break;
+  case TIM_CHANNEL_3:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC3);
+    break;
+  case TIM_CHANNEL_4:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC4);
+    break;
+  default:
+    return HAL_ERROR;
+  }
+
+  st.toggle_table = toggle_table;
+  st.toggle_count = toggle_count;
+  st.busy = true;
+  st.wait_last_cc = false;
+  st.dma_error = false;
+
+  // 从第 2 个翻转开始交给 DMA
+  if (toggle_count > 1U) {
+    HAL_StatusTypeDef ret = start_dma_tail(motor_id);
+    if (ret != HAL_OK) {
+      (void)stop_motor(motor_id);
+      return ret;
+    }
+  }
+
+  // DMA 传输期间先不开 CC 中断，避免中间每次 compare 都进中断
+  __HAL_TIM_DISABLE_IT(htim, channel_to_it(cfg.channel));
+
+  HAL_StatusTypeDef ret = m_oc.oc_start(cfg.channel);
+  if (ret != HAL_OK) {
+    (void)stop_motor(motor_id);
+    return ret;
+  }
+
+#if defined(TIM_BDTR_MOE)
+  if (IS_TIM_BREAK_INSTANCE(htim->Instance)) {
+    __HAL_TIM_MOE_ENABLE(htim);
+  }
+#endif
+
+  return HAL_OK;
+}
+//一个后面的翻转交给这个函数
+HAL_StatusTypeDef multi_stepper_dma::start_dma_tail(std::size_t motor_id) {
+  auto &cfg = m_cfg[motor_id];
+  auto &st = m_state[motor_id];
+  auto *htim = m_timer.get_htim();
+
+  if (htim == nullptr || cfg.dma == nullptr || st.toggle_count < 2U) {
+    return HAL_ERROR;
+  }
+
+  volatile uint32_t *ccr = channel_to_ccr(htim, cfg.channel);
+  if (ccr == nullptr) {
+    return HAL_ERROR;
+  }
+
+  // dma_proxy.start() 会自己绑定 Parent 和完成/错误回调。
+  cfg.dma->start(&st.toggle_table[1], ccr, st.toggle_count - 1U);
+  //开启DMA
+  __HAL_TIM_ENABLE_DMA(htim, channel_to_dma_req(cfg.channel));
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef multi_stepper_dma::stop_motor(std::size_t motor_id) {
+  if (motor_id >= motor_count) {
+    return HAL_ERROR;
+  }
+
+  auto &cfg = m_cfg[motor_id];
+  auto &st = m_state[motor_id];
+  auto *htim = m_timer.get_htim();
+  auto *hdma = cfg.dma ? cfg.dma->get_handle() : nullptr;
+
+  if (htim == nullptr) {
+    return HAL_ERROR;
+  }
+
+  __HAL_TIM_DISABLE_DMA(htim, channel_to_dma_req(cfg.channel));
+  __HAL_TIM_DISABLE_IT(htim, channel_to_it(cfg.channel));
+
+  if (hdma != nullptr) {
+    (void)HAL_DMA_Abort(hdma);
+  }
+
+  (void)m_oc.oc_stop(cfg.channel);
+
+  switch (cfg.channel) {
+  case TIM_CHANNEL_1:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC1);
+    break;
+  case TIM_CHANNEL_2:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC2);
+    break;
+  case TIM_CHANNEL_3:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC3);
+    break;
+  case TIM_CHANNEL_4:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC4);
+    break;
+  default:
+    break;
+  }
+
+  st = {};
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef multi_stepper_dma::emergency_stop_all() {
+  HAL_StatusTypeDef ret = HAL_OK;
+  for (std::size_t i = 0; i < motor_count; ++i) {
+    if (stop_motor(i) != HAL_OK) {
+      ret = HAL_ERROR;
+    }
+  }
+  return ret;
+}
+//DMA完成回调
+void multi_stepper_dma::on_dma_complete(std::size_t motor_id) {
+  if (motor_id >= motor_count) {
+    return;
+  }
+
+  auto &cfg = m_cfg[motor_id];
+  auto &st = m_state[motor_id];
+  auto *htim = m_timer.get_htim();
+
+  if (htim == nullptr || !st.busy) {
+    return;
+  }
+
+  // 最后一个 compare 已经写进 CCRx，但最后一次翻转还没真正发生。
+  __HAL_TIM_DISABLE_DMA(htim, channel_to_dma_req(cfg.channel));
+  st.wait_last_cc = true;
+
+  // 先清标志，再开这个通道自己的 CC 中断，等最后一次 compare 到来后 stop
+  switch (cfg.channel) {
+  case TIM_CHANNEL_1:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC1);
+    break;
+  case TIM_CHANNEL_2:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC2);
+    break;
+  case TIM_CHANNEL_3:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC3);
+    break;
+  case TIM_CHANNEL_4:
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC4);
+    break;
+  default:
+    return;
+  }
+
+  __HAL_TIM_ENABLE_IT(htim, channel_to_it(cfg.channel));
+}
+//DMA错误回调
+void multi_stepper_dma::on_dma_error(std::size_t motor_id) {
+  if (motor_id >= motor_count) {
+    return;
+  }
+  m_state[motor_id].dma_error = true;
+  (void)stop_motor(motor_id);
+}
+//CC事件回调
+void multi_stepper_dma::on_cc_event(std::size_t motor_id) {
+  if (motor_id >= motor_count) {
+    return;
+  }
+
+  auto &st = m_state[motor_id];
+  if (!st.busy || !st.wait_last_cc) {
+    return;
+  }
+
+  st.wait_last_cc = false;
+  (void)stop_motor(motor_id);
+}
+//通道到DMA请求
+uint32_t multi_stepper_dma::channel_to_dma_req(uint32_t channel) {
+  switch (channel) {
+  case TIM_CHANNEL_1:
+    return TIM_DMA_CC1;
+  case TIM_CHANNEL_2:
+    return TIM_DMA_CC2;
+  case TIM_CHANNEL_3:
+    return TIM_DMA_CC3;
+  case TIM_CHANNEL_4:
+    return TIM_DMA_CC4;
+  default:
+    return 0U;
+  }
+}
+//通道到中断
+uint32_t multi_stepper_dma::channel_to_it(uint32_t channel) {
+  switch (channel) {
+  case TIM_CHANNEL_1:
+    return TIM_IT_CC1;
+  case TIM_CHANNEL_2:
+    return TIM_IT_CC2;
+  case TIM_CHANNEL_3:
+    return TIM_IT_CC3;
+  case TIM_CHANNEL_4:
+    return TIM_IT_CC4;
+  default:
+    return 0U;
+  }
+}
+//通道到CCR
+volatile uint32_t *multi_stepper_dma::channel_to_ccr(TIM_HandleTypeDef *htim,
+                                                     uint32_t channel) {
+  if (htim == nullptr) {
+    return nullptr;
+  }
+
+  switch (channel) {
+  case TIM_CHANNEL_1:
+    return &htim->Instance->CCR1;
+  case TIM_CHANNEL_2:
+    return &htim->Instance->CCR2;
+  case TIM_CHANNEL_3:
+    return &htim->Instance->CCR3;
+  case TIM_CHANNEL_4:
+    return &htim->Instance->CCR4;
+  default:
+    return nullptr;
+  }
+}
+//通道到索引
+std::size_t multi_stepper_dma::channel_to_index(uint32_t channel) {
+  switch (channel) {
+  case TIM_CHANNEL_1:
+    return 0U;
+  case TIM_CHANNEL_2:
+    return 1U;
+  case TIM_CHANNEL_3:
+    return 2U;
+  case TIM_CHANNEL_4:
+    return 3U;
+  default:
+    return motor_count;
+  }
 }
 
 } // namespace app
