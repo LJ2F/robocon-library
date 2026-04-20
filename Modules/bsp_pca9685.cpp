@@ -1,6 +1,7 @@
-#include "PCA9658.hpp"
+#include "bsp_pca9685.hpp"
 
 #include "stm32f4xx_hal.h"
+#include "cmsis_os2.h"
 
 namespace gdut {
 //芯片有指定的频率范围，这里对频率进行裁剪

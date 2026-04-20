@@ -1,4 +1,4 @@
-#include "stepper_dma_control.hpp"
+#include "steppr_dma_control.hpp"
 
 #include <algorithm>
 
@@ -30,14 +30,19 @@ HAL_StatusTypeDef multi_stepper_dma::init() {
   for (std::size_t i = 0; i < motor_count; ++i) {
     auto &cfg = m_cfg[i];//每个电机一个
     const bool unused_cfg = (cfg.dma == nullptr && cfg.dir_port == nullptr &&
-                             cfg.dir_pin == 0U && cfg.pulse_high_ticks == 0U);
+                             cfg.dir_pin == 0U && cfg.pulse_high_ticks == 0U &&
+                             cfg.channel == 0U);
     if (unused_cfg) {
       m_state[i] = {};
       continue;
     }
 
+    const bool valid_channel = (cfg.channel == TIM_CHANNEL_1 ||
+                                cfg.channel == TIM_CHANNEL_2 ||
+                                cfg.channel == TIM_CHANNEL_3 ||
+                                cfg.channel == TIM_CHANNEL_4);
     if (cfg.dma == nullptr || cfg.dir_port == nullptr || cfg.dir_pin == 0U ||
-        cfg.pulse_high_ticks == 0U) {
+        cfg.pulse_high_ticks == 0U || !valid_channel) {
       return HAL_ERROR;
     }
 
@@ -210,8 +215,14 @@ HAL_StatusTypeDef multi_stepper_dma::start_dma_tail(std::size_t motor_id) {
     return HAL_ERROR;
   }
 
+  // dma_proxy::start() 当前接口使用 void*，这里显式去除限定符：
+  // - toggle_table 仅作为 DMA 源缓冲区被读取，不会被写入；
+  // - ccr 仅作为 DMA 目标地址传入，实际寄存器写入由 DMA 硬件完成。
+  void *src = static_cast<void *>(const_cast<uint32_t *>(&st.toggle_table[1]));
+  void *dst = static_cast<void *>(const_cast<uint32_t *>(ccr));
+
   // dma_proxy.start() 会自己绑定 Parent 和完成/错误回调。
-  cfg.dma->start(&st.toggle_table[1], ccr, st.toggle_count - 1U);
+  cfg.dma->start(src, dst, st.toggle_count - 1U);
   //开启DMA
   __HAL_TIM_ENABLE_DMA(htim, channel_to_dma_req(cfg.channel));
   return HAL_OK;

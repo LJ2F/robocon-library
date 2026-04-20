@@ -34,9 +34,9 @@ public:
   HAL_StatusTypeDef init(float pwm_freq_hz = 50.0f);
 
   // 探测设备是否存在
+  // timeout 表示单次探测的超时时间，单位为毫秒；该参数传递给底层 i2c::is_device_ready
   HAL_StatusTypeDef is_ready(
       std::uint32_t trials = 3,
-      //应该是这样用的，我忘了，可能会错
       std::chrono::milliseconds timeout = std::chrono::milliseconds(10));
 
   // 频率配置，所有的pwm都是同一个频率

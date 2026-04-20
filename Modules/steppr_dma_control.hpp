@@ -15,11 +15,11 @@ namespace gdut {
 class multi_stepper_dma {
 public:
   struct motor_config {
-    uint32_t channel;           // TIM_CHANNEL_1~4
-    gdut::dma_proxy *dma;       // 该通道对应的 DMA
-    GPIO_TypeDef *dir_port;     // 方向脚
-    uint16_t dir_pin;
-    uint16_t pulse_high_ticks;  // STEP 高电平宽度
+    uint32_t channel{0};                  // TIM_CHANNEL_1~4
+    gdut::dma_proxy *dma{nullptr};        // 该通道对应的 DMA
+    GPIO_TypeDef *dir_port{nullptr};      // 方向脚
+    uint16_t dir_pin{0};
+    uint16_t pulse_high_ticks{0};         // STEP 高电平宽度
   };
 
   struct motor_state {
