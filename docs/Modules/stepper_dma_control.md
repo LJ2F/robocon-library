@@ -52,11 +52,11 @@
 
 * STEP 对应定时器复用引脚
 
-* ![](%E6%AD%A5%E8%BF%9B%E7%94%B5%E6%9C%BA%E7%9A%84%E9%85%8D%E7%BD%AE_md_files/6ec73690-3c47-11f1-9ecd-05b583adcd41.jpeg?v=1&type=image)
+* ![img](./img/dma_ctl_1.jpeg)
 
-* ![](%E6%AD%A5%E8%BF%9B%E7%94%B5%E6%9C%BA%E7%9A%84%E9%85%8D%E7%BD%AE_md_files/9c7405f0-3c47-11f1-9ecd-05b583adcd41.jpeg?v=1&type=image)
+* ![](./img/dma_ctl_2.jpeg)
 
-* ![](%E6%AD%A5%E8%BF%9B%E7%94%B5%E6%9C%BA%E7%9A%84%E9%85%8D%E7%BD%AE_md_files/a431d5b0-3c47-11f1-9ecd-05b583adcd41.jpeg?v=1&type=image)
+* ![](./img/dma_ctl_3.jpeg)
 
 ***
 

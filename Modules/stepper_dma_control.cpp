@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace app {
+namespace gdut {
 //构造函数
 multi_stepper_dma::multi_stepper_dma(
     gdut::timer &timer,

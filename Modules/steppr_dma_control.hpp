@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <system_error>
 
-namespace app {
+namespace gdut {
 
 class multi_stepper_dma {
 public:
