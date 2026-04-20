@@ -5,11 +5,15 @@
 #include "stm32f407xx.h"
 #include "uncopyable.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 namespace gdut {
 
 class motor : private gdut::uncopyable {
+  static_assert(std::atomic<uint32_t>::is_always_lock_free);
+  static_assert(std::atomic<float>::is_always_lock_free);
+
 public:
   // pwm_timer:用于 PWM 输出的timer对象指针
   // pwm_channel_A:正转通道
@@ -40,21 +44,27 @@ public:
         pwm_channel_A_(other.pwm_channel_A_),
         direction_gpio_port_(other.direction_gpio_port_),
         direction_gpio_pin_(other.direction_gpio_pin_), ppr_(other.ppr_),
-        current_encoder_count_(other.current_encoder_count_),
-        total_revolutions_(other.total_revolutions_),
-        current_speed_(other.current_speed_) {
+        current_encoder_count_(
+            other.current_encoder_count_.load(std::memory_order_acquire)),
+        total_revolutions_(
+            other.total_revolutions_.load(std::memory_order_acquire)),
+        current_speed_(other.current_speed_.load(std::memory_order_acquire)) {
     other.pwm_timer_ = nullptr;
     other.encoder_timer_ = nullptr;
   }
 
   // ----- 获取状态 -----
-  float get_current_speed() const { return current_speed_; } // 当前转速
+  float get_current_speed() const {
+    return current_speed_.load(std::memory_order_acquire);
+  } // 当前转速
 
   float get_total_revolutions() const {
-    return total_revolutions_;
+    return total_revolutions_.load(std::memory_order_acquire);
   } // 累计转动圈数
 
-  uint32_t get_current_encoder_count() const { return current_encoder_count_; }
+  uint32_t get_current_encoder_count() const {
+    return current_encoder_count_.load(std::memory_order_acquire);
+  }
 
   // ----- 控制 -----
 
@@ -68,28 +78,34 @@ public:
 
     // 读取编码器计数值
     gdut::timer::timer_proxy encoder_proxy(encoder_timer_);
-    const uint32_t previous_encoder_count = current_encoder_count_;
-    const uint32_t current_counter = encoder_proxy.get_counter();
-    const uint32_t counter_width = encoder_proxy.get_arr() + 1U;
+    const uint32_t previous_encoder_count =
+        current_encoder_count_.load(std::memory_order_acquire);
+    uint32_t current_counter = encoder_proxy.get_counter();
+    const uint64_t counter_width =
+        static_cast<uint64_t>(encoder_proxy.get_arr()) + 1ULL;
+    const int64_t half_range = static_cast<int64_t>(counter_width / 2ULL);
     int64_t delta_count = static_cast<int64_t>(current_counter) -
                           static_cast<int64_t>(previous_encoder_count);
 
-    // 处理编码器计数回绕：将差值归一到 [-width/2, width/2]
-    const int64_t half_width = static_cast<int64_t>(counter_width / 2U);
-    if (delta_count > half_width) {
+    // 该解包方法要求：单个控制周期内编码器增量绝对值小于计数器范围的一半
+    if (delta_count > half_range) {
+      // 发生了向下溢出
       delta_count -= static_cast<int64_t>(counter_width);
-    } else if (delta_count < -half_width) {
+    } else if (delta_count < -half_range) {
+      // 发生了向上溢出
       delta_count += static_cast<int64_t>(counter_width);
     }
 
-    current_encoder_count_ = current_counter;
+    current_encoder_count_.store(current_counter, std::memory_order_release);
 
     // 累计圈数：按增量累加，保留真实累计语义
-    total_revolutions_ += static_cast<float>(delta_count) / ppr_;
+    total_revolutions_.fetch_add(static_cast<float>(delta_count) / ppr_,
+                                 std::memory_order_relaxed);
 
     // 计算当前转速（转/秒）
-    current_speed_ =
-        static_cast<float>(delta_count) / (ppr_ * control_period_sec);
+    current_speed_.store(static_cast<float>(delta_count) /
+                             (ppr_ * control_period_sec),
+                         std::memory_order_release);
   }
 
   // 通过 GPIO 控制方向，并设置单个 PWM 通道的占空比
@@ -124,9 +140,12 @@ protected:
   void init_encoder_state() {
     if (!encoder_timer_)
       return;
+    gdut::timer::timer_encoder encoder(encoder_timer_);
+    (void)encoder.encoder_start(TIM_CHANNEL_ALL);
     gdut::timer::timer_proxy proxy(encoder_timer_);
-    current_encoder_count_ = proxy.get_counter();
-    total_revolutions_ = static_cast<float>(current_encoder_count_) / ppr_;
+    current_encoder_count_.store(proxy.get_counter(), std::memory_order_release);
+    total_revolutions_.store(0.0f, std::memory_order_release);
+    current_speed_.store(0.0f, std::memory_order_release);
   }
 
 private:
@@ -141,9 +160,9 @@ private:
   float ppr_; // 一圈脉冲数
 
   // 状态变量
-  uint32_t current_encoder_count_;
-  float total_revolutions_; // 累计圈数
-  float current_speed_;     // 转/秒
+  std::atomic<uint32_t> current_encoder_count_;
+  std::atomic<float> total_revolutions_; // 累计圈数
+  std::atomic<float> current_speed_;     // 转/秒
 };
 
 } // namespace gdut
