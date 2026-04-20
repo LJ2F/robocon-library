@@ -107,7 +107,11 @@ HAL_StatusTypeDef pca9685::init(float pwm_freq_hz) {
     return status;
   }
 
-  osDelay(1);
+  if (m_delay_callback) {
+    m_delay_callback(1);
+  } else {
+    osDelay(1);
+  }
 
   status = set_pwm_freq(pwm_freq_hz);
   if (status != HAL_OK) {
@@ -126,7 +130,11 @@ HAL_StatusTypeDef pca9685::wakeup() {
   }
 
   // 官方手册给的是振荡器起来最多 500us，这里留 1ms 更稳
-  osDelay(1);
+  if (m_delay_callback) {
+    m_delay_callback(1);
+  } else {
+    osDelay(1);
+  }
 
   // 写 1 到 RESTART 位以重启 PWM 逻辑
   return update_mode1_bits(mode1_restart, 0);
