@@ -8,18 +8,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <system_error>
 
 namespace gdut {
 
 class multi_stepper_dma {
 public:
   struct motor_config {
-    uint32_t channel{0};                  // TIM_CHANNEL_1~4
-    gdut::dma_proxy *dma{nullptr};        // 该通道对应的 DMA
-    GPIO_TypeDef *dir_port{nullptr};      // 方向脚
+    uint32_t channel{0};             // TIM_CHANNEL_1~4
+    gdut::dma_proxy *dma{nullptr};   // 该通道对应的 DMA
+    GPIO_TypeDef *dir_port{nullptr}; // 方向脚
     uint16_t dir_pin{0};
-    uint16_t pulse_high_ticks{0};         // STEP 高电平宽度
+    uint16_t pulse_high_ticks{0}; // STEP 高电平宽度
   };
 
   struct motor_state {
@@ -30,7 +29,8 @@ public:
     bool dma_error{false};                 // 是否 DMA 错误
   };
 
-  static constexpr std::size_t motor_count = 4; // 一个 TIM 最多支持 4 路输出比较
+  static constexpr std::size_t motor_count =
+      4; // 一个 TIM 最多支持 4 路输出比较
 
   multi_stepper_dma(gdut::timer &timer,
                     const std::array<motor_config, motor_count> &configs);
@@ -55,12 +55,10 @@ public:
 
   // period_table[i] = 第 i 个脉冲的总周期
   // out_toggle_table = [rise0, fall0, rise1, fall1, ...]
-  static std::size_t build_toggle_table(const uint16_t *period_table,
-                                        std::size_t pulse_count,
-                                        uint16_t pulse_high_ticks,
-                                        uint32_t first_rise_tick,
-                                        uint32_t *out_toggle_table,
-                                        std::size_t out_cap);
+  static std::size_t
+  build_toggle_table(const uint16_t *period_table, std::size_t pulse_count,
+                     uint16_t pulse_high_ticks, uint32_t first_rise_tick,
+                     uint32_t *out_toggle_table, std::size_t out_cap);
 
 private:
   HAL_StatusTypeDef start_dma_tail(std::size_t motor_id);
@@ -82,6 +80,6 @@ private:
   std::array<motor_state, motor_count> m_state;
 };
 
-} // namespace app
+} // namespace gdut
 
 #endif // MULTI_STEPPER_DMA_HPP
