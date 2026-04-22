@@ -18,9 +18,12 @@ HAL_StatusTypeDef line_follower_8ch::probe(std::chrono::milliseconds timeout) {
     return m_i2c->is_device_ready(m_i2c_hal_addr, 3, timeout);
   }
 
-  // GPIO 模式没有设备应答，这里只检查引脚是否配置完整。
-  if (m_gpio.ad0.port == nullptr || m_gpio.ad1.port == nullptr ||
-      m_gpio.ad2.port == nullptr || m_gpio.out.port == nullptr) {
+  // GPIO 模式没有设备应答，这里检查引脚是否配置完整：
+  // 既要求 port 非空，也要求 pin 掩码非 0，避免后续读写时实际不操作任何引脚。
+  if (m_gpio.ad0.port == nullptr || m_gpio.ad0.pin == 0 ||
+      m_gpio.ad1.port == nullptr || m_gpio.ad1.pin == 0 ||
+      m_gpio.ad2.port == nullptr || m_gpio.ad2.pin == 0 ||
+      m_gpio.out.port == nullptr || m_gpio.out.pin == 0) {
     return HAL_ERROR;
   }
   return HAL_OK;
@@ -79,7 +82,6 @@ HAL_StatusTypeDef line_follower_8ch::read_line_array(
 //读取单个通道的巡线识别结果
 HAL_StatusTypeDef line_follower_8ch::read_channel_line(
     uint8_t channel, uint8_t &detected, std::chrono::milliseconds timeout) {
-  (void)timeout;
   detected = 0;
 
   if (!valid_channel(channel)) {
