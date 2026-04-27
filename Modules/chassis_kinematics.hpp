@@ -48,6 +48,8 @@ public:
     return inverse_kinematics_matrix * wheel_velocities;
   }
 };
+template<float Radius>
+using chassis_kinematics = universal_wheel_kinematics<Radius>;
 
 template<float Width, float Length>
 class mcanum_wheel_kinematics {
